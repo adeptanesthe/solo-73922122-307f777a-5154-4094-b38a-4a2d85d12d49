@@ -48,6 +48,9 @@
   .danger-note { border:1px dashed var(--err); border-radius:8px; padding:10px 12px;
                  color:#fca5a5; font-size:13px; margin-top:12px; }
   code { background:#0b1220; padding:1px 6px; border-radius:5px; font-size:12.5px; }
+  .anomaly-item { border:1px solid var(--err); background:rgba(239,68,68,.12);
+                  border-radius:8px; padding:8px 12px; margin-top:6px; font-size:13px; color:#fecaca; }
+  .hash-mono { font-family:ui-monospace,monospace; font-size:12px; color:var(--muted); }
 </style>
 </head>
 <body>
@@ -92,6 +95,39 @@
       已把网页端口移出白名单：本页面随后将失联（请求挂死/失败）。
       独立看护进程会在确认窗口到期后自动恢复旧规则，届时刷新本页即可恢复访问——无需登录宿主操作。
     </div>
+  </div>
+
+  <div class="card">
+    <h2>结案记录核验（审计链 + 本地见证服务）</h2>
+    <p class="muted">
+      确认 / 超时回退 / 应用失败的结案记录与审计链在同一事务落库，独立投递进程按序送往
+      <b>本地见证服务</b>（独立存储，可信）。本页取得见证最新回执后核对本地链：
+      删除已见证尾部、篡改后重算本地摘要都会被判为不完整。
+    </p>
+    <div id="verifyVerdict"><span class="muted">核验中…</span></div>
+    <div class="grid2" style="margin-top:10px">
+      <div>
+        <div class="muted">见证服务</div>
+        <div id="verifyWitness">—</div>
+        <div class="muted" style="margin-top:8px">已见证前缀</div>
+        <div id="verifyPrefix">—</div>
+      </div>
+      <div>
+        <div class="muted">本地审计链</div>
+        <div id="verifyLocal">—</div>
+        <div class="muted" style="margin-top:8px">尚未见证</div>
+        <div id="verifyUnwitnessed">—</div>
+      </div>
+    </div>
+    <div id="verifyAnomalies" style="margin-top:10px"></div>
+    <div class="row">
+      <button class="btn-pri" id="verifyNowBtn">立即核验</button>
+      <span class="muted" id="verifyTime"></span>
+    </div>
+    <table style="margin-top:12px">
+      <thead><tr><th>序号</th><th>变更单</th><th>结果</th><th>结案时间</th><th>摘要</th><th>见证</th></tr></thead>
+      <tbody id="auditBody"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+    </table>
   </div>
 
   <div class="grid2">
@@ -232,6 +268,72 @@ function parsePorts(text) {
   return ports;
 }
 
+// ---------------- 结案记录核验 ----------------
+function shortHash(h) { return h ? h.slice(0, 12) + "…" : "—"; }
+function fmtTime(epoch) { return epoch ? new Date(epoch * 1000).toLocaleString() : "—"; }
+
+async function refreshVerify() {
+  let v;
+  try {
+    const r = await fetch("/api/audit/verify", { cache: "no-store" });
+    v = await r.json();
+  } catch (e) {
+    $("verifyVerdict").innerHTML = '<span class="pill s-err">核验接口不可达</span>';
+    return;
+  }
+
+  const verdictMap = {
+    ok:                  ["s-ok",   "✓ 已见证前缀完整，全部记录已见证"],
+    pending:             ["s-warn", "已见证前缀完整，有记录等待见证（异步投递，非异常）"],
+    anomaly:             ["s-err",  "✗ 核验异常：本地审计链与见证不一致"],
+    witness_unreachable: ["s-warn", "见证服务暂不可达，无法完成比对"],
+    empty:               ["s-warn", "暂无结案审计记录"],
+    error:               ["s-err",  "核验执行失败"],
+  };
+  const [cls, txt] = verdictMap[v.verdict] || ["s-warn", v.verdict || "未知"];
+  $("verifyVerdict").innerHTML = `<span class="pill ${cls}" style="font-size:14px">${txt}</span>`;
+
+  const w = v.witness || {};
+  $("verifyWitness").innerHTML = w.reachable
+    ? `<span class="pill s-ok">可达</span> <code>${w.url}</code><br>
+       <span class="muted">最新回执 seq=${w.latest?.seq ?? 0}，摘要 <span class="hash-mono">${shortHash(w.latest?.record_hash)}</span>，${fmtTime(w.latest?.witnessed_at)}</span>`
+    : `<span class="pill s-err">不可达</span> <code>${w.url || ""}</code><br><span class="muted">${w.error || ""}</span>`;
+
+  const L = v.local || {};
+  $("verifyLocal").innerHTML =
+    `共 <b>${L.length ?? 0}</b> 条，链头摘要 <span class="hash-mono">${shortHash(L.head_hash)}</span><br>` +
+    `<span class="muted">本地回执缓存 ${L.receipts_cached ?? 0} 条</span>`;
+
+  const p = v.witnessed_prefix || {};
+  $("verifyPrefix").innerHTML = (p.complete === null || p.complete === undefined)
+    ? '<span class="pill s-warn">无法判定（见证不可达）</span>'
+    : (p.complete
+        ? `<span class="pill s-ok">完整</span> <span class="muted">seq 1..${p.seq} 与见证回执一致</span>`
+        : `<span class="pill s-err">不完整</span> <span class="muted">见证到 seq ${p.seq}</span>`);
+
+  $("verifyUnwitnessed").innerHTML = (v.unwitnessed_count === null || v.unwitnessed_count === undefined)
+    ? '<span class="muted">—</span>'
+    : (v.unwitnessed_count > 0
+        ? `<span class="pill s-warn">${v.unwitnessed_count} 条</span> <span class="muted">投递进程会自动补投，稍候即归零</span>`
+        : '<span class="pill s-ok">0 条</span>');
+
+  $("verifyAnomalies").innerHTML = (v.anomalies || []).map(a =>
+    `<div class="anomaly-item">⚠ ${a.reason}</div>`).join("");
+
+  const rows = (v.recent_audit || []).map(a => `
+    <tr><td>${a.seq}</td><td>#${a.change_id}</td><td>${statusPill(a.result)}</td>
+    <td class="muted">${fmtTime(a.happened_at)}</td>
+    <td class="hash-mono">${shortHash(a.hash)}</td>
+    <td>${a.witnessed === null ? '<span class="muted">—</span>'
+        : a.witnessed ? '<span class="pill s-ok">已见证</span>'
+        : '<span class="pill s-warn">待投递</span>'}</td></tr>`).join("");
+  $("auditBody").innerHTML = rows || '<tr><td colspan="6" class="muted">暂无结案审计记录</td></tr>';
+
+  $("verifyTime").textContent = "最近核验：" + new Date().toLocaleTimeString();
+}
+
+$("verifyNowBtn").onclick = refreshVerify;
+
 $("applyBtn").onclick = () => {
   let ports;
   try { ports = parsePorts($("portsInput").value); }
@@ -255,7 +357,9 @@ async function loadConfig() {
 }
 
 loadConfig().then(refresh);
+refreshVerify();
 pollTimer = setInterval(refresh, 1500);
+setInterval(refreshVerify, 2000);
 </script>
 </body>
 </html>

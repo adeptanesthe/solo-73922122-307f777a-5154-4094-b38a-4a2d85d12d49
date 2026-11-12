@@ -21,6 +21,14 @@ NFT_CHAIN_PRIORITY = 0
 
 DB_PATH = os.getenv("DB_PATH", "/data/mgmt.db")
 
+# 本地见证服务（独立容器、独立存储，威胁模型中可信）
+# 投递进程与网页核验均通过该地址访问见证服务
+WITNESS_URL = os.getenv("WITNESS_URL", "http://127.0.0.1:9000")
+# 访问见证服务的 HTTP 超时（秒）：只影响投递/核验，绝不影响回退路径
+WITNESS_TIMEOUT_SECONDS = float(os.getenv("WITNESS_TIMEOUT_SECONDS", "5"))
+# 投递进程轮询周期（秒）
+FORWARDER_INTERVAL_SECONDS = float(os.getenv("FORWARDER_INTERVAL_SECONDS", "1"))
+
 # 初始放行端口：管理网页 + HTTP 回显服务
 INITIAL_PORTS = sorted({WEB_PORT, ECHO_PORT})
 

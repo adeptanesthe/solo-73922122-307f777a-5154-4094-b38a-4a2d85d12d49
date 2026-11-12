@@ -1,20 +1,36 @@
-# 入站端口白名单变更管理（FastAPI + SQLite + nftables）
+# 入站端口白名单变更管理（FastAPI + SQLite + nftables + 本地见证）
 
 面向远程运维场景：调整入站端口白名单时，如果误封了管理网页自身，系统会在确认窗口
 （默认 30 秒）到期后由**独立于 Web 的看护进程**自动恢复旧规则，无需登录宿主操作。
 
+本轮新增**结案审计链 + 本地见证服务**：确认、超时回退、应用失败三类终态与审计记录
+在**同一个 SQLite 事务**中落库，记录变更 ID、前后端口、结果与时间，并以连续序号 +
+SHA-256 前项摘要串成只能追加的哈希链；独立投递进程把审计记录按序送往**本地见证服务**
+（独立容器、独立存储，威胁模型中可信）。首页新增**结案记录核验**卡片：取得见证最新
+回执后核对本地链，分别显示已见证前缀是否完整、尚未见证条数及异常原因——
+**删除已见证尾部、篡改后重算本地摘要，都会被判为不完整**。
+
 ## 架构与边界
 
 ```
-容器（独立网络命名空间，不使用 network_mode: host）
-├── bootstrap.py   入口恢复：先恢复“已确认规则”，再开放网页
-├── nft.py         nftables 适配：仅操作专用表 inet port_mgmt，原子批量提交
-├── firewall.py    变更业务：应用 / 确认 / 超时回退
-├── db.py          SQLite 持久层（WAL）：已确认规则 + 全部变更单
-├── watchdog.py    独立看护进程：超时未确认即回退，Web 退出后仍值守
-├── main.py        FastAPI 管理网页（应用、确认、状态查看）
-├── echo_server.py 附带的 HTTP 回显服务
-└── /data/mgmt.db  命名卷持久化
+Compose 环境（两个容器，独立存储卷）
+┌─ port-mgmt（独立网络命名空间，不使用 network_mode: host）────────────┐
+│  bootstrap.py    入口恢复：先恢复“已确认规则”，再开放网页             │
+│  nft.py          nftables 适配：仅操作专用表 inet port_mgmt，原子批量  │
+│  firewall.py     变更业务：应用 / 确认 / 超时回退                      │
+│  db.py           SQLite 持久层（WAL）：已确认规则 + 变更单 + 审计链    │
+│  audit_chain.py  审计链规范化与 SHA-256 摘要（三方共用）               │
+│  watchdog.py     独立看护进程：超时未确认即回退，Web 退出后仍值守      │
+│  forwarder.py    独立投递进程：审计记录按序送往见证服务（断点续投）    │
+│  verifier.py     网页侧核验：见证回执 vs 本地链                        │
+│  main.py         FastAPI 管理网页（应用、确认、状态、核验）            │
+│  echo_server.py  附带的 HTTP 回显服务                                 │
+│  /data/mgmt.db   命名卷 port_mgmt_data 持久化                         │
+└──────────────────────────────────────────────────────────────────────┘
+┌─ witness（本地见证服务，威胁模型中可信）─────────────────────────────┐
+│  witness_server.py 按序保存审计记录与回执（幂等、拒异内容/前项不符）   │
+│  /witness-data/witness.db  独立命名卷 witness_data 持久化             │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 * **只修改容器内专用表** `inet port_mgmt`（链 `input_filter`，策略 `drop`），
@@ -36,6 +52,49 @@
 5. Web 进程退出不影响回退（看护进程是独立 OS 进程，按数据库中的截止时间判定）。
 6. 整套服务重启：遗留 pending 单全部作废，**先恢复已确认规则，再开放网页**。
 
+## 结案审计链与本地见证（本轮新增）
+
+### 记账：终态与审计记录同一事务
+
+* 确认、超时回退、应用失败三类终态，与对应审计记录在**同一个 SQLite 事务**中落库
+  （`db.confirm_change` / `db.mark_expired_if_pending` / `db.mark_failed`，
+  启动恢复批量作废 `db.expire_all_pending` 同理）。
+* 每条审计记录：连续序号 `seq`、变更单 ID、变更前端口、本次目标端口、结果
+  （confirmed/expired/failed）、结案时间、说明、前项摘要 `prev_hash`、
+  本条摘要 `hash`（SHA-256，覆盖含 prev_hash 在内的全部内容字段）。
+  首条记录的 `prev_hash` 为创世值（64 个 0）。
+* 序号连续性由 `BEGIN IMMEDIATE` 写事务串行化保证，并发结案不会产生空洞。
+
+### 投递：独立进程按序送往见证服务
+
+* `forwarder.py` 与 Web、看护进程完全独立：**慢见证/见证不可达绝不拖住 30 秒回退**，
+  Web 退出后回退仍照常记账并续投。
+* 投递进度以**见证服务的最新回执**为准：任一服务重启后从“见证最新序号 + 1”续投；
+  见证已保存而回执丢失时，重发同一条记录会拿到**原回执**（见证幂等）；
+  本地回执缓存缺失的序号会周期性向见证补拉。
+* 见证服务（`witness_server.py`，独立容器 + 独立卷）：
+  - 同序号同内容 → 返回**原回执**（幂等）；
+  - 同序号异内容、序号跳跃/乱序、前项摘要不符、摘要与内容不符 → **拒绝**；
+  - 记录与回执在同一事务中持久化到独立存储。
+
+### 核验：网页取得见证最新回执后核对本地链
+
+首页“结案记录核验”卡片（`GET /api/audit/verify`）分别显示：
+
+* **已见证前缀是否完整**：本地链 1..W（W = 见证最新回执序号）逐条连续、摘要自洽，
+  且 seq W 处本地摘要与见证回执一致；
+  - 删除已见证尾部 → 本地缺失已见证序号 → 不完整；
+  - 篡改后重算本地摘要 → 链头摘要与见证回执不符 → 不完整；
+* **尚未见证条数**：本地链中序号 > W 的记录数（异步投递的正常中间态，**不算异常**）；
+* **异常原因**：序号不连续 / 前项摘要不符 / 摘要与内容不符 / 缺失已见证记录 /
+  链头与回执不符等，逐条列出。
+
+防误报关键：核验**先取见证回执、再读本地链**。本地链只追加、见证内容只能来自本地链，
+因此并发结案（确认/回退与核验同时发生）不会造成误报。
+
+**威胁模型**：仅本地数据库（port-mgmt 容器的 mgmt.db）可能被改；
+见证服务及其独立存储可信。因此回执无需签名——可信方的一句话即可钉住链头。
+
 ## 快速启动
 
 ```bash
@@ -46,8 +105,9 @@ docker compose up --build
 
 | 服务 | 地址 | 说明 |
 |---|---|---|
-| 管理网页 | http://localhost:8080/ | 应用 / 确认 / 状态查看 |
+| 管理网页 | http://localhost:8080/ | 应用 / 确认 / 状态查看 / **结案记录核验** |
 | HTTP 回显 | http://localhost:8090/ | 验证端口连通性，返回请求 JSON 回显 |
+| 见证服务 | http://localhost:9000/witness/latest | 查看最新回执（演示/排错用） |
 
 初始白名单为 `8080`（网页）+ `8090`（回显），首次启动时写入 SQLite 并下发 nft。
 
@@ -59,12 +119,39 @@ docker compose up --build
    回显服务 http://localhost:8090/ 仍可正常访问。
 3. 不要点确认。等待 30 秒：看护进程自动回退到旧白名单，
    页面自动恢复访问，变更记录中该单显示“已过期回退”。
+4. 页面下方“结案记录核验”卡片显示：本次回退已记入审计链并获见证回执，
+   已见证前缀完整、尚未见证 0 条。
 
 命令行端到端演示：
 
 ```bash
 ./demo.sh
 ```
+
+### 演示：篡改本地库被核验发现
+
+```bash
+TAMPER_DEMO=1 ./demo.sh                 # 默认删除已见证尾部
+TAMPER_DEMO=1 TAMPER_MODE=recompute ./demo.sh   # 篡改后重算全部本地摘要
+```
+
+两种方式下核验卡片都会变红：前者报“本地缺失已见证记录”，
+后者报“已见证前缀末端摘要与见证回执不符”。重置演示环境：
+
+```bash
+docker compose down -v && docker compose up --build
+```
+
+### 演示：慢见证不拖住回退
+
+```bash
+docker compose up -d
+docker compose exec -d witness env WITNESS_DELAY_SECONDS=8 python -u witness_server.py
+# 或直接在 compose 中把 witness 的 WITNESS_DELAY_SECONDS 改为 8 后重启
+```
+
+此时投递/核验变慢（尚未见证条数短暂 >0），但 30 秒确认窗口与超时回退
+依旧按原期限发生——回退路径从不访问见证服务。
 
 容器内查看实际 nft 规则（只读）：
 
@@ -80,6 +167,16 @@ docker compose exec port-mgmt nft list table inet port_mgmt
 | GET | `/api/status` | 已确认白名单、pending 倒计时、生效规则、历史变更 |
 | POST | `/api/apply` | body `{"ports":[8080,8090]}` 应用新白名单（pending 时 409） |
 | POST | `/api/confirm` | body `{"change_id":1}` 窗口内确认（过期/旧单 409） |
+| GET | `/api/audit/verify` | 结案核验：见证回执 vs 本地链（前缀完整性/未见证数/异常原因） |
+
+见证服务（容器网络内 `http://witness:9000`，宿主机 `http://localhost:9000`）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/witness/records` | 接收一条审计记录（幂等；异内容/前项不符/乱序拒绝） |
+| GET | `/witness/latest` | 最新回执（空链时 `seq=0`） |
+| GET | `/witness/receipts/{seq}` | 指定序号回执（丢回执后补拉用） |
+| GET | `/health` | 健康检查 |
 
 ## 配置（环境变量，见 docker-compose.yml）
 
@@ -91,6 +188,12 @@ docker compose exec port-mgmt nft list table inet port_mgmt
 | `WATCHDOG_INTERVAL_SECONDS` | 0.5 | 看护进程轮询周期 |
 | `NFT_TABLE_NAME` | port_mgmt | 容器内专用 nft 表名 |
 | `DB_PATH` | /data/mgmt.db | SQLite 路径（命名卷持久化） |
+| `WITNESS_URL` | http://witness:9000 | 见证服务地址（投递与核验共用） |
+| `WITNESS_TIMEOUT_SECONDS` | 5 | 访问见证服务的 HTTP 超时（只影响投递/核验） |
+| `FORWARDER_INTERVAL_SECONDS` | 1 | 投递进程轮询周期 |
+| `WITNESS_PORT`（witness 容器） | 9000 | 见证服务监听端口 |
+| `WITNESS_DB_PATH`（witness 容器） | /witness-data/witness.db | 见证独立存储路径 |
+| `WITNESS_DELAY_SECONDS`（witness 容器） | 0 | 演示钩子：人为放慢见证响应 |
 
 ## 说明与注意事项
 
@@ -100,3 +203,5 @@ docker compose exec port-mgmt nft list table inet port_mgmt
   重试，直到规则真正恢复，避免“状态显示回退但规则未恢复”。
 * 健康检查走容器回环接口（回环永远放行），因此网页端口被封时健康检查仍可工作。
 * 页面强制白名单至少保留一个端口，避免提交空规则导致永久失联。
+* 审计链只能追加：业务代码不提供任何修改/删除审计记录的接口；
+  威胁模型内的篡改（直接改库）由“见证回执 vs 本地链”核验发现。

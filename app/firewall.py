@@ -15,7 +15,7 @@ from typing import Any
 import db
 import nft
 from config import CONFIRM_WINDOW_SECONDS
-from db import FAILED, PENDING
+from db import PENDING
 
 # 进程内串行化“应用”请求；跨进程的最终一致性由 SQLite 单 pending 约束保证
 _apply_lock = threading.Lock()
@@ -82,7 +82,8 @@ def apply_change(requested_ports: list[int]) -> ApplyResult:
             # 3. 原子生效；nft 批量事务失败时内核保留旧规则
             nft.apply_ruleset(ports)
         except Exception as exc:  # NftError 及其子类
-            db.mark_change_status(change_id, FAILED, detail=f"应用失败，旧规则保留: {exc}")
+            # 应用失败终态与审计记录在同一事务落库
+            db.mark_failed(change_id, detail=f"应用失败，旧规则保留: {exc}")
             raise ChangeError(f"防火墙应用失败，已保留旧规则: {exc}") from exc
 
     return ApplyResult(
@@ -119,14 +120,14 @@ def confirm_change(change_id: int) -> dict[str, Any]:
             f"变更单 #{change_id} 已超过确认截止时间，规则已/将回退到旧白名单"
         )
 
-    if not db.confirm_change(change_id, now):
+    new_ports = json.loads(row["requested_ports"])
+    # 确认终态 + 审计记录 + 新已确认白名单在同一事务落库
+    if not db.confirm_change(change_id, now, new_confirmed_ports=new_ports):
         # 与看护进程竞争落败
         raise ChangeError(
             f"变更单 #{change_id} 已被看护进程超时回退，确认无效，当前规则不受影响"
         )
 
-    new_ports = json.loads(row["requested_ports"])
-    db.set_confirmed_ports(new_ports)  # 持久化新的已确认规则
     # 竞争兜底：若看护进程在截止边界已把 nft 回退到旧规则，这里把规则
     # 重新固化为已确认的新白名单，保证数据库状态与 nft 始终一致
     nft.apply_ruleset(new_ports)

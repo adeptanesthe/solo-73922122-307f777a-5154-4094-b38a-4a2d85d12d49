@@ -8,12 +8,12 @@ services:
       - NET_ADMIN   # 在容器网络命名空间内操作 nftables 所必需
       - NET_RAW     # nft/排错工具所需（原始套接字）
     ports:
-      # 浏览器入口：管理网页
+      # 浏览器入口：管理网页（含结案记录核验卡片）
       - "8080:8080"
       # 附带的 HTTP 回显服务
       - "8090:8090"
     volumes:
-      # SQLite 持久化：已确认规则与变更单跨容器重启保留
+      # SQLite 持久化：已确认规则、变更单与结案审计链跨容器重启保留
       - port_mgmt_data:/data
     environment:
       WEB_PORT: "8080"
@@ -21,6 +21,12 @@ services:
       CONFIRM_WINDOW_SECONDS: "30"
       NFT_TABLE_NAME: "port_mgmt"
       DB_PATH: "/data/mgmt.db"
+      # 本地见证服务地址（独立容器、独立存储，投递与核验都走这里）
+      WITNESS_URL: "http://witness:9000"
+      WITNESS_TIMEOUT_SECONDS: "5"
+      FORWARDER_INTERVAL_SECONDS: "1"
+    depends_on:
+      - witness
     restart: unless-stopped
     # 健康检查走回环接口（回环永远放行），不依赖白名单
     healthcheck:
@@ -30,5 +36,31 @@ services:
       retries: 5
       start_period: 5s
 
+  witness:
+    # 本地见证服务：与业务容器同镜像但独立进程、独立存储卷
+    # （威胁模型中可信：只负责按序保存审计记录与回执）
+    image: port-mgmt:latest
+    container_name: port-mgmt-witness
+    command: ["python", "-u", "witness_server.py"]
+    environment:
+      WITNESS_PORT: "9000"
+      WITNESS_DB_PATH: "/witness-data/witness.db"
+      # 演示钩子：>0 时人为放慢见证响应，验证“慢见证不拖住 30 秒回退”
+      WITNESS_DELAY_SECONDS: "0"
+    volumes:
+      # 独立存储：与业务数据库完全分离
+      - witness_data:/witness-data
+    ports:
+      # 发布到宿主机便于演示/排错（curl 查看回执），业务链路走容器网络
+      - "9000:9000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 3s
+
 volumes:
   port_mgmt_data:
+  witness_data:

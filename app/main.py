@@ -4,7 +4,9 @@
 * 查看当前状态：已确认白名单、待确认变更与倒计时、nft 生效规则、历史变更；
 * 应用新的 TCP 端口白名单；
 * 在确认窗口内确认本次变更；
-* 提供“移除网页端口”的一键演示入口（失联后由看护进程自动回退恢复）。
+* 提供“移除网页端口”的一键演示入口（失联后由看护进程自动回退恢复）；
+* 结案记录核验：取得本地见证服务最新回执，核对本地审计链，
+  显示已见证前缀是否完整、尚未见证条数及异常原因。
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ from pydantic import BaseModel, Field, field_validator
 
 import db
 import firewall
+import verifier
 from config import CONFIRM_WINDOW_SECONDS, ECHO_PORT, WEB_PORT
 
 logging.basicConfig(
@@ -125,6 +128,24 @@ def api_confirm(req: ConfirmRequest) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     log.info("变更单 #%s 已确认，白名单固化为 %s", req.change_id, out["confirmed_ports"])
     return {"ok": True, **out}
+
+
+@app.get("/api/audit/verify")
+def api_audit_verify() -> JSONResponse:
+    """结案记录核验：见证最新回执 vs 本地审计链。"""
+    try:
+        return JSONResponse(verifier.verify())
+    except Exception as exc:  # 核验本身失败不应拖垮页面
+        log.exception("核验执行失败")
+        return JSONResponse(
+            {
+                "now": time.time(),
+                "verdict": "error",
+                "error": str(exc),
+                "anomalies": [{"seq": None, "reason": f"核验执行失败: {exc}"}],
+            },
+            status_code=200,
+        )
 
 
 # 静态资源（如有）
